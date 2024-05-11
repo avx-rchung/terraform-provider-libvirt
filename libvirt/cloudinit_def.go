@@ -9,13 +9,16 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	libvirt "github.com/digitalocean/go-libvirt"
+	diskfs "github.com/diskfs/go-diskfs"
+	"github.com/diskfs/go-diskfs/disk"
+	"github.com/diskfs/go-diskfs/filesystem"
+	"github.com/diskfs/go-diskfs/filesystem/iso9660"
 	"github.com/google/uuid"
-	"github.com/hooklift/iso9660"
+	oldIso9660 "github.com/hooklift/iso9660"
 )
 
 const userDataFileName string = "user-data"
@@ -141,58 +144,53 @@ func getCloudInitVolumeKeyFromTerraformID(id string) (string, error) {
 // Returns a string with the full path to the ISO file.
 func (ci *defCloudInit) createISO() (string, error) {
 	log.Print("Creating new ISO")
-	tmpDir, err := ci.createFiles()
-	if err != nil {
-		return "", err
-	}
-
-	isoDestination := filepath.Join(tmpDir, ci.Name)
-	cmd := exec.Command(
-		"mkisofs",
-		"-output",
-		isoDestination,
-		"-volid",
-		"cidata",
-		"-joliet",
-		"-rock",
-		filepath.Join(tmpDir, userDataFileName),
-		filepath.Join(tmpDir, metaDataFileName),
-		filepath.Join(tmpDir, networkConfigFileName))
-
-	log.Printf("About to execute cmd: %+v", cmd)
-	if err = cmd.Run(); err != nil {
-		return "", fmt.Errorf("error while starting the creation of CloudInit's ISO image: %w", err)
-	}
-	log.Printf("ISO created at %s", isoDestination)
-
-	return isoDestination, nil
-}
-
-// write user-data,  meta-data network-config in tmp files and dedicated directory
-// Returns a string containing the name of the temporary directory and an error
-// object.
-func (ci *defCloudInit) createFiles() (string, error) {
-	log.Print("Creating ISO contents")
 	tmpDir, err := os.MkdirTemp("", "cloudinit")
 	if err != nil {
 		return "", fmt.Errorf("cannot create tmp directory for cloudinit ISO generation: %w", err)
 	}
-	// user-data
-	if err = os.WriteFile(filepath.Join(tmpDir, userDataFileName), []byte(ci.UserData), os.ModePerm); err != nil {
-		return "", fmt.Errorf("error while writing user-data to file: %w", err)
+	isoDestination := filepath.Join(tmpDir, ci.Name)
+	isoDisk, err := diskfs.Create(isoDestination, 10*1024*1024, diskfs.Raw, diskfs.SectorSizeDefault)
+	if err != nil {
+		return "", fmt.Errorf("error while creating ISO disk: %w", err)
 	}
-	// meta-data
-	if err = os.WriteFile(filepath.Join(tmpDir, metaDataFileName), []byte(ci.MetaData), os.ModePerm); err != nil {
-		return "", fmt.Errorf("error while writing meta-data to file: %w", err)
+	isoDisk.LogicalBlocksize = 2048
+	spec := disk.FilesystemSpec{Partition: 0, FSType: filesystem.TypeISO9660, VolumeLabel: "cidata"}
+	fs, err := isoDisk.CreateFilesystem(spec)
+	if err != nil {
+		return "", fmt.Errorf("error while creating ISO filesystem: %w", err)
 	}
-	// network-config
-	if err = os.WriteFile(filepath.Join(tmpDir, networkConfigFileName), []byte(ci.NetworkConfig), os.ModePerm); err != nil {
-		return "", fmt.Errorf("error while writing network-config to file: %w", err)
+	for _, s := range []struct {
+		name     string
+		contents string
+	}{
+		{name: userDataFileName, contents: ci.UserData},
+		{name: metaDataFileName, contents: ci.MetaData},
+		{name: networkConfigFileName, contents: ci.NetworkConfig},
+	} {
+		rw, err := fs.OpenFile(s.name, os.O_CREATE|os.O_RDWR)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("error while opening %s: %w", s.name, err)
+		}
+		if _, err := rw.Write([]byte(s.contents)); err != nil {
+			return "", fmt.Errorf("error while writing %s: %w", s.name, err)
+		}
+		if err := rw.Close(); err != nil {
+			return "", fmt.Errorf("error while closing %s: %w", s.name, err)
+		}
 	}
+	iso, ok := fs.(*iso9660.FileSystem)
+	if !ok {
+		return "", fmt.Errorf("not an iso9660 filesystem")
+	}
+	if err := iso.Finalize(iso9660.FinalizeOptions{
+		RockRidge:        true,
+		VolumeIdentifier: "cidata",
+	}); err != nil {
+		return "", fmt.Errorf("error while finalizing ISO: %w", err)
+	}
+	log.Printf("ISO created at %s", isoDestination)
 
-	log.Print("ISO contents created")
-
-	return tmpDir, nil
+	return isoDestination, nil
 }
 
 // Creates a new defCloudInit object starting from a ISO volume handled by
@@ -238,7 +236,7 @@ func newCloudInitDefFromRemoteISO(_ context.Context, virConn *libvirt.Libvirt, i
 
 // setCloudInitDataFromExistingCloudInitDisk read and set UserData, MetaData, and NetworkConfig from existing CloudInitDisk.
 func (ci *defCloudInit) setCloudInitDataFromExistingCloudInitDisk(isoFile *os.File) error {
-	isoReader, err := iso9660.NewReader(isoFile)
+	isoReader, err := oldIso9660.NewReader(isoFile)
 	if err != nil {
 		return fmt.Errorf("error initializing ISO reader: %w", err)
 	}
