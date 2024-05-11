@@ -2,8 +2,9 @@ package libvirt
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
+
+	"github.com/diskfs/go-diskfs"
 )
 
 func TestCloudInitTerraformKeyOps(t *testing.T) {
@@ -22,47 +23,36 @@ func TestCloudInitTerraformKeyOps(t *testing.T) {
 	}
 }
 
-func TestCloudInitCreateFiles(t *testing.T) {
+func TestCloudInitCreateISO(t *testing.T) {
 	ci := newCloudInitDef()
-
-	dir, err := ci.createFiles()
-	if err != nil {
-		t.Errorf("Unexpected error %v", err)
-	}
-	defer os.RemoveAll(dir)
-	for _, file := range []string{"user-data", "meta-data", "network-config"} {
-		check, err := exists(filepath.Join(dir, file))
-		if !check {
-			t.Errorf("%s not found: %v", file, err)
-		}
-	}
-}
-
-func TestCloudInitCreateISONoExternalTool(t *testing.T) {
-	path := os.Getenv("PATH")
-	defer os.Setenv("PATH", path)
-
-	os.Setenv("PATH", "/")
-
-	ci := newCloudInitDef()
+	ci.Name = "test.iso"
+	ci.UserData = "test-user-data"
+	ci.MetaData = "test-meta-data"
+	ci.NetworkConfig = "test-network-config"
 
 	iso, err := ci.createISO()
-	if err == nil {
-		t.Errorf("Expected error")
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if iso == "" {
+		t.Errorf("Unexpected iso to be empty")
+	}
+	t.Logf("iso: %s", iso)
+
+	disk, err := diskfs.Open(iso)
+	if err != nil {
+		t.Fatalf("Failed to open iso: %v", err)
+	}
+	fs, err := disk.GetFilesystem(0)
+	if err != nil {
+		t.Fatalf("Failed to get filesystem: %v", err)
 	}
 
-	if iso != "" {
-		t.Errorf("Expected iso to be empty")
+	for _, path := range []string{"/user-data", "/meta-data", "/network-config"} {
+		f, err := fs.OpenFile(path, os.O_RDONLY)
+		if err != nil {
+			t.Errorf("Failed to open file %s: %v", path, err)
+		}
+		f.Close()
 	}
-}
-
-func exists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	if err == nil {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return true, err
 }
